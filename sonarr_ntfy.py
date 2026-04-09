@@ -323,12 +323,16 @@ if __name__ == "__main__":
     print(f"SONARR_URL={SONARR_URL}")
     print(f"SONARR_API loaded={bool(SONARR_API)}")
 
-    app.run(host=HOST, port=PORT, debug=False)
-
-    # Startup notification to ntfy (runs just after app starts)
-    send_ntfy_curl_style(
-        title="🚀 Sonarr Season Webhook started",
+    # Send startup notification before blocking on app.run
+    success = send_ntfy_curl_style(
+        title="Sonarr Season Webhook started",
         message="Application is up and listening for Sonarr webhook events.",
-        click_url="http://{}:{}".format(HOST, PORT),
+        click_url=f"http://{HOST}:{PORT}",
         tags="tv,system",
     )
+    if success:
+        print("Startup notification sent")
+    else:
+        print("Failed to send startup notification")
+
+    app.run(host=HOST, port=PORT, debug=False)
