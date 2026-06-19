@@ -36,7 +36,9 @@ PORT = int(os.getenv("PORT", "5000"))
 
 season_buffer = {}
 timers = {}
+processed_keys = set()  # ADD: Track recently processed keys to prevent duplicates
 buffer_lock = threading.Lock()
+processed_lock = threading.Lock()  # ADD: Separate lock for processed_keys
 
 
 def get_season_total_eps(series_id, season_num):
@@ -202,6 +204,20 @@ def build_notification(events, key, is_full_season=False, total_eps=0):
 
 
 def flush_season(key, events_override=None, is_full_season=False, total_eps=0):
+    # ADD: Check for duplicate processing at the start
+    with processed_lock:
+        if key in processed_keys:
+            print(f"⏸ SKIPPED duplicate flush for {key} (already processed)")
+            return
+        processed_keys.add(key)
+
+    # ADD: Schedule cleanup of processed_keys after BUFFER_TIMEOUT
+    def cleanup_task():
+        with processed_lock:
+            processed_keys.discard(key)
+
+    threading.Timer(BUFFER_TIMEOUT, cleanup_task).start()
+
     try:
         with buffer_lock:
             events = list(events_override) if events_override is not None else load_events_for_key(key)
@@ -212,6 +228,8 @@ def flush_season(key, events_override=None, is_full_season=False, total_eps=0):
                 return
 
             clear_state_for_key(key)
+
+        print(f"🔥 FLUSHING {key} | full_season={is_full_season} | eps={len(events_override or events)}")
 
         title, message, click_url, poster_url = build_notification(
             events,
@@ -260,13 +278,14 @@ def webhook():
             expected_full_list = list(range(1, total_eps + 1)) if total_eps > 0 else []
             is_full_season = total_eps > 0 and ep_list == expected_full_list
 
-            print(f"⏳ Debounced {key}: buffered={len(ep_list)} total_eps={total_eps}")
+            print(f"⏳ Debounced {key}: buffered={len(ep_list)} total_eps={total_eps} full={is_full_season}")
 
             if is_full_season:
                 flush_now = True
                 flush_events = list(existing_events)
                 clear_state_for_key(key)
             else:
+                # Cancel existing timer
                 old_timer = timers.pop(key, None)
                 if old_timer:
                     try:
@@ -276,10 +295,12 @@ def webhook():
 
                 save_events_for_key(key, existing_events)
 
-                t = threading.Timer(BUFFER_TIMEOUT, flush_season, [key])
-                t.daemon = True
-                timers[key] = t
-                t.start()
+                # Only schedule timer if NOT flushing now as full season
+                if not flush_now:
+                    t = threading.Timer(BUFFER_TIMEOUT, flush_season, [key])
+                    t.daemon = True
+                    timers[key] = t
+                    t.start()
 
         if flush_now:
             flush_season(
@@ -311,11 +332,15 @@ def health():
         active_buffers = len(season_buffer)
         active_timers = len(timers)
 
+    with processed_lock:
+        recent_processed = len(processed_keys)
+
     return jsonify({
         "status": "ok",
         "buffers": active_buffers,
         "timers": active_timers,
         "sonarr_api_loaded": bool(SONARR_API),
+        "recent_processed_keys": recent_processed,
     })
 
 
@@ -323,7 +348,6 @@ if __name__ == "__main__":
     print(f"SONARR_URL={SONARR_URL}")
     print(f"SONARR_API loaded={bool(SONARR_API)}")
 
-    # Send startup notification before blocking on app.run
     success = send_ntfy_curl_style(
         title="Sonarr Season Webhook started",
         message="Application is up and listening for Sonarr webhook events.",
