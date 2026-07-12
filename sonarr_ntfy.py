@@ -28,7 +28,6 @@ SONARR_LINK = os.getenv("SONARR_LINK", "")
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "")
 base_ntfy_url = os.getenv("NTFY_URL", "").rstrip("/")
 NTFY_URL = f"{base_ntfy_url}/{NTFY_TOPIC}" if base_ntfy_url and NTFY_TOPIC else ""
-NTFY_TOKEN = os.getenv("NTFY_TOKEN", "").strip()
 
 BUFFER_TIMEOUT = int(os.getenv("BUFFER_TIMEOUT", "600"))
 
@@ -118,9 +117,6 @@ def send_ntfy_curl_style(title, message, click_url, poster_url=None, tags="tv"):
         "Content-Type": "text/plain",
     }
 
-    if NTFY_TOKEN:
-        headers["Authorization"] = f"Bearer {NTFY_TOKEN}"
-
     if poster_url:
         headers["Attach"] = poster_url
 
@@ -132,10 +128,6 @@ def send_ntfy_curl_style(title, message, click_url, poster_url=None, tags="tv"):
             timeout=10,
         )
         print(f"✅ ntfy: {resp.status_code} | {title[:60]}")
-
-        if resp.status_code != 200:
-            print(f"❌ ntfy response: {resp.text}")
-
         return resp.status_code == 200
     except Exception as e:
         print(f"❌ ntfy: {e}")
@@ -324,16 +316,14 @@ def health():
         "buffers": active_buffers,
         "timers": active_timers,
         "sonarr_api_loaded": bool(SONARR_API),
-        "ntfy_token_loaded": bool(NTFY_TOKEN),
     })
 
 
 if __name__ == "__main__":
     print(f"SONARR_URL={SONARR_URL}")
     print(f"SONARR_API loaded={bool(SONARR_API)}")
-    print(f"NTFY_URL={NTFY_URL}")
-    print(f"NTFY_TOKEN loaded={bool(NTFY_TOKEN)}")
 
+    # Send startup notification before blocking on app.run
     success = send_ntfy_curl_style(
         title="Sonarr Season Webhook started",
         message="Application is up and listening for Sonarr webhook events.",
