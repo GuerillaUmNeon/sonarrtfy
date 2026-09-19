@@ -42,7 +42,7 @@ season_buffer = {}
 timers = {}
 completed_seasons = set()
 buffer_lock = threading.Lock()
-
+notified_complete = set()
 
 def now_local():
     return datetime.now(TIMEZONE)
@@ -331,13 +331,31 @@ def flush_season(key, events_override=None, is_full_season=False, total_eps=0):
 
             clear_state_for_key(key)
 
+        # Determine if this is a "season complete" notification
+        series = events[0].get("series", {})
+        series_id = series.get("id")
+        season_num = int(key.split(":")[1])
+        complete_key = f"{series_id}:{season_num}"
+
+        is_complete = is_full_season and total_eps > 0
+
+        # If this is a "Complete" notification and we already sent one, skip
+        if is_complete and complete_key in notified_complete:
+            print(f"Skipping duplicate 'Complete' notification for {complete_key}")
+            return
+
         title, message, click_url, poster_url = build_notification(
             events,
             key,
             is_full_season=is_full_season,
             total_eps=total_eps,
         )
-        send_ntfy_curl_style(title, message, click_url, poster_url, "tv")
+
+        ok = send_ntfy_curl_style(title, message, click_url, poster_url, "tv")
+
+        # Only mark as notified if send succeeded
+        if ok and is_complete:
+            notified_complete.add(complete_key)
 
     except Exception as e:
         print(f"flush_season({key}) error: {e}")
