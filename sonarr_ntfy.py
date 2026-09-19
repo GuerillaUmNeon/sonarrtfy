@@ -42,7 +42,8 @@ season_buffer = {}
 timers = {}
 completed_seasons = set()
 buffer_lock = threading.Lock()
-notified_complete = set()
+notified_complete = {}  # dict[str, float]
+COMPLETE_DEDUP_TTL = int(os.getenv("COMPLETE_DEDUP_TTL", "86400"))
 
 def now_local():
     return datetime.now(TIMEZONE)
@@ -331,7 +332,6 @@ def flush_season(key, events_override=None, is_full_season=False, total_eps=0):
 
             clear_state_for_key(key)
 
-        # Determine if this is a "season complete" notification
         series = events[0].get("series", {})
         series_id = series.get("id")
         season_num = int(key.split(":")[1])
@@ -339,10 +339,14 @@ def flush_season(key, events_override=None, is_full_season=False, total_eps=0):
 
         is_complete = is_full_season and total_eps > 0
 
-        # If this is a "Complete" notification and we already sent one, skip
-        if is_complete and complete_key in notified_complete:
-            print(f"Skipping duplicate 'Complete' notification for {complete_key}")
-            return
+        if is_complete:
+            now = datetime.now(TIMEZONE).timestamp()
+            prev = notified_complete.get(complete_key)
+
+            # If we notified recently (within TTL), skip
+            if prev is not None and (now - prev) < COMPLETE_DEDUP_TTL:
+                print(f"Skipping duplicate 'Complete' notification for {complete_key} (within TTL)")
+                return
 
         title, message, click_url, poster_url = build_notification(
             events,
@@ -353,9 +357,8 @@ def flush_season(key, events_override=None, is_full_season=False, total_eps=0):
 
         ok = send_ntfy_curl_style(title, message, click_url, poster_url, "tv")
 
-        # Only mark as notified if send succeeded
         if ok and is_complete:
-            notified_complete.add(complete_key)
+            notified_complete[complete_key] = datetime.now(TIMEZONE).timestamp()
 
     except Exception as e:
         print(f"flush_season({key}) error: {e}")
@@ -376,6 +379,15 @@ def schedule_flush(key, delay_seconds):
     timers[key] = timer
     timer.start()
 
+
+def cleanup_expired_dedup():
+    now = datetime.now(TIMEZONE).timestamp()
+    with buffer_lock:
+        expired = [k for k, ts in notified_complete.items() if (now - ts) >= COMPLETE_DEDUP_TTL]
+        for k in expired:
+            notified_complete.pop(k, None)
+    if expired:
+        print(f"Cleaned up {len(expired)} expired complete-notification entries")
 
 @app.route("/sonarr-webhook", methods=["POST"])
 def webhook():
@@ -513,5 +525,19 @@ if __name__ == "__main__":
         tags="tv,system",
     )
     print("Startup notification sent" if success else "Failed to send startup notification")
+
+
+    def periodic_cleanup():
+        while True:
+            time.sleep(3600)  # every hour
+            try:
+                cleanup_expired_dedup()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
+
+    cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
+    cleanup_thread.start()
 
     app.run(host=HOST, port=PORT, debug=False)
