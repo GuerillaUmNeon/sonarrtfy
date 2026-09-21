@@ -45,6 +45,9 @@ buffer_lock = threading.Lock()
 notified_complete = {}  # dict[str, float]
 COMPLETE_DEDUP_TTL = int(os.getenv("COMPLETE_DEDUP_TTL", "86400"))
 
+notified_last_episode = {}  # dict[str, float]
+LAST_EP_DEDUP_TTL = int(os.getenv("LAST_EP_DEDUP_TTL", "300"))  # 5 minutes default
+
 def now_local():
     return datetime.now(TIMEZONE)
 
@@ -320,7 +323,7 @@ def build_notification(events, key, is_full_season=False, total_eps=0):
     return title, message, click_url, poster_url
 
 
-def flush_season(key, events_override=None, is_full_season=False, total_eps=0):
+def flush_season(key, events_override=None, is_full_season=False, total_eps=0, flush_reason="buffer"):
     try:
         with buffer_lock:
             events = list(events_override) if events_override is not None else load_events_for_key(key)
@@ -335,19 +338,29 @@ def flush_season(key, events_override=None, is_full_season=False, total_eps=0):
         series = events[0].get("series", {})
         series_id = series.get("id")
         season_num = int(key.split(":")[1])
-        complete_key = f"{series_id}:{season_num}"
+        ep_list = extract_episode_numbers(events)
 
-        is_complete = is_full_season and total_eps > 0
+        # Dedup for "last episode" notifications
+        if flush_reason == "last_episode" and series_id:
+            now_ts = datetime.now(TIMEZONE).timestamp()
+            episodes_to_notify = []
 
-        if is_complete:
-            now = datetime.now(TIMEZONE).timestamp()
-            prev = notified_complete.get(complete_key)
+            for ep_num in ep_list:
+                ep_key = f"{series_id}:{season_num}:{ep_num}"
+                prev = notified_last_episode.get(ep_key)
+                if prev is None or (now_ts - prev) >= LAST_EP_DEDUP_TTL:
+                    episodes_to_notify.append(ep_num)
 
-            # If we notified recently (within TTL), skip
-            if prev is not None and (now - prev) < COMPLETE_DEDUP_TTL:
-                print(f"Skipping duplicate 'Complete' notification for {complete_key} (within TTL)")
+            if not episodes_to_notify:
+                print(f"Skipping duplicate 'last episode' notification for {key} (within TTL)")
                 return
 
+            # Rebuild message to only include episodes we’re actually notifying for
+            # (optional; if you prefer, you can still notify for all ep_list)
+            # For simplicity, we’ll just skip the whole notification if all are dupes.
+            # If at least one is new, we proceed normally but could adjust message if desired.
+
+        # Existing notification logic
         title, message, click_url, poster_url = build_notification(
             events,
             key,
@@ -357,14 +370,16 @@ def flush_season(key, events_override=None, is_full_season=False, total_eps=0):
 
         ok = send_ntfy_curl_style(title, message, click_url, poster_url, "tv")
 
-        if ok and is_complete:
-            notified_complete[complete_key] = datetime.now(TIMEZONE).timestamp()
+        if ok and flush_reason == "last_episode" and series_id:
+            now_ts = datetime.now(TIMEZONE).timestamp()
+            for ep_num in ep_list:
+                ep_key = f"{series_id}:{season_num}:{ep_num}"
+                notified_last_episode[ep_key] = now_ts
 
     except Exception as e:
         print(f"flush_season({key}) error: {e}")
         import traceback
         traceback.print_exc()
-
 
 def schedule_flush(key, delay_seconds):
     old_timer = timers.pop(key, None)
@@ -374,7 +389,7 @@ def schedule_flush(key, delay_seconds):
         except Exception:
             pass
 
-    timer = threading.Timer(delay_seconds, flush_season, [key])
+    timer = threading.Timer(delay_seconds, flush_season, [key], kwargs={"flush_reason": "buffer"})
     timer.daemon = True
     timers[key] = timer
     timer.start()
@@ -388,6 +403,20 @@ def cleanup_expired_dedup():
             notified_complete.pop(k, None)
     if expired:
         print(f"Cleaned up {len(expired)} expired complete-notification entries")
+
+
+def cleanup_expired_episode_dedup():
+    now = datetime.now(TIMEZONE).timestamp()
+    with buffer_lock:
+        expired = [
+            k for k, ts in notified_last_episode.items()
+            if (now - ts) >= LAST_EP_DEDUP_TTL
+        ]
+        for k in expired:
+            notified_last_episode.pop(k, None)
+    if expired:
+        print(f"Cleaned up {len(expired)} expired last-episode dedup entries")
+
 
 @app.route("/sonarr-webhook", methods=["POST"])
 def webhook():
@@ -465,11 +494,13 @@ def webhook():
                 schedule_flush(key, delay_seconds)
 
         if flush_now:
+            reason = "full_season" if full_season else "last_episode"
             flush_season(
                 key,
                 events_override=flush_events,
                 is_full_season=full_season,
                 total_eps=total_eps,
+                flush_reason=reason,
             )
 
         return jsonify(
@@ -529,13 +560,13 @@ if __name__ == "__main__":
 
     def periodic_cleanup():
         while True:
-            time.sleep(3600)  # every hour
+            time.sleep(3600)
             try:
                 cleanup_expired_dedup()
+                cleanup_expired_episode_dedup()
             except Exception:
                 import traceback
                 traceback.print_exc()
-
 
     cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
     cleanup_thread.start()
