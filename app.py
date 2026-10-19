@@ -3,11 +3,20 @@ import threading
 import requests
 import os
 import re
-from datetime import datetime, time, timedelta
+import time
+import logging
+import traceback
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s [%(levelname)s] %(threadName)s %(message)s",
+)
+log = logging.getLogger("sonarrtfy")
 
 
 def slugify_title(title):
@@ -32,23 +41,21 @@ NTFY_TOKEN = os.getenv("NTFY_TOKEN", "").strip()
 
 BUFFER_TIMEOUT = int(os.getenv("BUFFER_TIMEOUT", "600"))
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Amsterdam"))
-QUIET_START = time(1, 0)
-QUIET_END = time(8, 30)
+QUIET_START = dtime(1, 0)
+QUIET_END = dtime(8, 30)
 
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "5000"))
 
 season_buffer = {}
 timers = {}
-buffer_lock = threading.Lock()
+completed_seasons = set()  # FIX: was referenced but never defined
+buffer_lock = threading.RLock()  # FIX: RLock so clear_state_for_key is safe from flush_season
 
-# Fingerprint -> timestamp. Prevents duplicate sends when a Timer callback
-# races the webhook path for the same (series, season, episodes, full_season).
-notified_complete = {}  # dict[tuple, float]
+notified_complete = {}
 COMPLETE_DEDUP_TTL = int(os.getenv("COMPLETE_DEDUP_TTL", "86400"))
 
-# Per-episode dedup for "last episode of the season" notifications.
-notified_last_episode = {}  # dict[str, float]
+notified_last_episode = {}
 LAST_EP_DEDUP_TTL = int(os.getenv("LAST_EP_DEDUP_TTL", "300"))
 
 
@@ -82,7 +89,7 @@ def get_series(series_id):
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        print(f"API error loading series {series_id}: {e}")
+        log.warning("API error loading series %s: %s", series_id, e)
         return None
 
 
@@ -97,10 +104,10 @@ def get_season_total_eps(series_id, season_num, series_data=None):
     )
 
     total = (
-        season_data.get("statistics", {}).get("episodeCount")
-        or season_data.get("episodeCount")
-        or season_data.get("totalEpisodeCount")
-        or 0
+            season_data.get("statistics", {}).get("episodeCount")
+            or season_data.get("episodeCount")
+            or season_data.get("totalEpisodeCount")
+            or 0
     )
 
     try:
@@ -110,12 +117,6 @@ def get_season_total_eps(series_id, season_num, series_data=None):
 
 
 def get_last_released_episode(series_id):
-    """Return the latest released standard episode according to Sonarr.
-
-    The /episode endpoint provides airDateUtc. Episodes without an air date or
-    whose air date is in the future are ignored. Specials (season 0) are also
-    ignored, because they should not make a regular-season episode "the last".
-    """
     if not series_id or not SONARR_URL:
         return None
 
@@ -129,7 +130,7 @@ def get_last_released_episode(series_id):
         resp.raise_for_status()
         episodes = resp.json()
     except Exception as e:
-        print(f"API error loading episodes for series {series_id}: {e}")
+        log.warning("API error loading episodes for series %s: %s", series_id, e)
         return None
 
     now_utc = datetime.now(ZoneInfo("UTC"))
@@ -158,7 +159,6 @@ def get_last_released_episode(series_id):
     if not released:
         return None
 
-    # Air date is primary. Season/episode makes ties deterministic.
     _, season_num, episode_num = max(released, key=lambda x: (x[0], x[1], x[2]))
     return season_num, episode_num
 
@@ -215,6 +215,7 @@ def save_events_for_key(key, events):
 
 
 def clear_state_for_key(key):
+    """Caller must hold buffer_lock."""
     season_buffer.pop(key, None)
     timer = timers.pop(key, None)
     if timer:
@@ -225,16 +226,20 @@ def clear_state_for_key(key):
 
 
 def send_ntfy_curl_style(title, message, click_url, poster_url=None, tags="tv"):
+    # FIX: try block dedented out of `if poster_url:` — previously the request
+    # was never sent when poster_url was None (broke the startup notification).
     if not NTFY_URL:
-        print("ntfy URL not configured")
+        log.warning("ntfy URL not configured")
         return False
 
     headers = {
         "Title": title,
-        "Click": click_url,
         "Tags": tags,
         "Content-Type": "text/plain",
     }
+
+    if click_url:
+        headers["Click"] = click_url
 
     if NTFY_TOKEN:
         headers["Authorization"] = f"Bearer {NTFY_TOKEN}"
@@ -242,25 +247,22 @@ def send_ntfy_curl_style(title, message, click_url, poster_url=None, tags="tv"):
     if poster_url:
         headers["Attach"] = poster_url
 
-        try:
-            resp = requests.post(
-                NTFY_URL,
-                headers=headers,
-                data=message.encode("utf-8"),
-                timeout=10,
-            )
-            print(f"ntfy: {resp.status_code} | {title[:60]}")
+    try:
+        resp = requests.post(
+            NTFY_URL,
+            headers=headers,
+            data=message.encode("utf-8"),
+            timeout=10,
+        )
+        log.info("ntfy: %s | %s", resp.status_code, title[:60])
 
-            if resp.status_code != 200:
-                try:
-                    print(f"ntfy response body: {resp.text}")
-                except Exception:
-                    pass
+        if resp.status_code != 200:
+            log.warning("ntfy response body: %s", resp.text[:300])
 
-            return resp.status_code == 200
-        except Exception as e:
-            print(f"ntfy error: {e}")
-            return False
+        return resp.status_code == 200
+    except Exception as e:
+        log.error("ntfy error: %s", e)
+        return False
 
 
 def find_season_poster(series, season_num):
