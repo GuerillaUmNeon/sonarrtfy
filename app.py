@@ -47,16 +47,21 @@ QUIET_END = dtime(8, 30)
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "5000"))
 
+# Sonarr event types:
+# - "Download": file imported or upgraded
+# - "Grab": release sent to download client
+# - "Rename": files renamed
+# We only want actual imported/upgraded files.
+ALLOWED_EVENT_TYPES = {"Download"}
+
 season_buffer = {}
 timers = {}
-completed_seasons = set()  # FIX: was referenced but never defined
-buffer_lock = threading.RLock()  # FIX: RLock so clear_state_for_key is safe from flush_season
+completed_seasons = set()
+buffer_lock = threading.RLock()
 
-notified_complete = {}
-COMPLETE_DEDUP_TTL = int(os.getenv("COMPLETE_DEDUP_TTL", "86400"))
-
-notified_last_episode = {}
-LAST_EP_DEDUP_TTL = int(os.getenv("LAST_EP_DEDUP_TTL", "300"))
+# One dedup store for every notification type.
+notified_episodes = {}
+EPISODE_DEDUP_TTL = int(os.getenv("EPISODE_DEDUP_TTL", "86400"))
 
 
 def now_local():
@@ -71,8 +76,10 @@ def in_quiet_window():
 def seconds_until_0830():
     now = now_local()
     target = now.replace(hour=8, minute=30, second=0, microsecond=0)
+
     if target <= now:
         target += timedelta(days=1)
+
     return max(0, (target - now).total_seconds())
 
 
@@ -95,6 +102,7 @@ def get_series(series_id):
 
 def get_season_total_eps(series_id, season_num, series_data=None):
     data = series_data or get_series(series_id)
+
     if not data:
         return 0
 
@@ -104,10 +112,10 @@ def get_season_total_eps(series_id, season_num, series_data=None):
     )
 
     total = (
-            season_data.get("statistics", {}).get("episodeCount")
-            or season_data.get("episodeCount")
-            or season_data.get("totalEpisodeCount")
-            or 0
+        season_data.get("statistics", {}).get("episodeCount")
+        or season_data.get("episodeCount")
+        or season_data.get("totalEpisodeCount")
+        or 0
     )
 
     try:
@@ -143,8 +151,10 @@ def get_last_released_episode(series_id):
 
         if not isinstance(season_num, int) or season_num <= 0:
             continue
+
         if not isinstance(episode_num, int) or episode_num <= 0:
             continue
+
         if not air_date_utc:
             continue
 
@@ -173,6 +183,7 @@ def event_contains_episode(events, season_num, episode_num):
                 return True
 
             episode_numbers = ep.get("episodeNumbers", [])
+
             if isinstance(episode_numbers, list) and episode_num in episode_numbers:
                 return True
 
@@ -181,6 +192,7 @@ def event_contains_episode(events, season_num, episode_num):
 
 def is_last_released_episode(series_id, events):
     last_episode = get_last_released_episode(series_id)
+
     if not last_episode:
         return False
 
@@ -194,10 +206,12 @@ def extract_episode_numbers(events):
     for event in events:
         for ep in event.get("episodes", []):
             ep_num = ep.get("episodeNumber")
+
             if isinstance(ep_num, int) and 1 <= ep_num <= 999:
                 nums.add(ep_num)
 
             ep_nums = ep.get("episodeNumbers", [])
+
             if isinstance(ep_nums, list):
                 for n in ep_nums:
                     if isinstance(n, int) and 1 <= n <= 999:
@@ -217,7 +231,9 @@ def save_events_for_key(key, events):
 def clear_state_for_key(key):
     """Caller must hold buffer_lock."""
     season_buffer.pop(key, None)
+
     timer = timers.pop(key, None)
+
     if timer:
         try:
             timer.cancel()
@@ -225,9 +241,36 @@ def clear_state_for_key(key):
             pass
 
 
+def should_notify_episodes(series_id, season_num, ep_list):
+    """Return only episode numbers that have not been notified within the TTL."""
+    if not series_id:
+        return ep_list
+
+    now_ts = datetime.now(TIMEZONE).timestamp()
+    fresh_episodes = []
+
+    for ep_num in ep_list:
+        dedup_key = f"{series_id}:{season_num}:{ep_num}"
+        previous = notified_episodes.get(dedup_key)
+
+        if previous is None or (now_ts - previous) >= EPISODE_DEDUP_TTL:
+            fresh_episodes.append(ep_num)
+
+    return fresh_episodes
+
+
+def mark_episodes_notified(series_id, season_num, ep_list):
+    if not series_id:
+        return
+
+    now_ts = datetime.now(TIMEZONE).timestamp()
+
+    for ep_num in ep_list:
+        dedup_key = f"{series_id}:{season_num}:{ep_num}"
+        notified_episodes[dedup_key] = now_ts
+
+
 def send_ntfy_curl_style(title, message, click_url, poster_url=None, tags="tv"):
-    # FIX: try block dedented out of `if poster_url:` — previously the request
-    # was never sent when poster_url was None (broke the startup notification).
     if not NTFY_URL:
         log.warning("ntfy URL not configured")
         return False
@@ -254,6 +297,7 @@ def send_ntfy_curl_style(title, message, click_url, poster_url=None, tags="tv"):
             data=message.encode("utf-8"),
             timeout=10,
         )
+
         log.info("ntfy: %s | %s", resp.status_code, title[:60])
 
         if resp.status_code != 200:
@@ -267,6 +311,7 @@ def send_ntfy_curl_style(title, message, click_url, poster_url=None, tags="tv"):
 
 def find_season_poster(series, season_num):
     root_folder = series.get("path")
+
     if not root_folder:
         return None
 
@@ -287,6 +332,7 @@ def find_season_poster(series, season_num):
 
     for rel_path in candidates:
         full_path = os.path.join(root_folder, rel_path)
+
         if os.path.exists(full_path):
             return full_path
 
@@ -299,6 +345,7 @@ def build_notification(events, key, is_full_season=False, total_eps=0):
     season_num = int(key.split(":")[1])
 
     ep_list = extract_episode_numbers(events)
+
     if not ep_list:
         raise ValueError(f"No episode numbers found for {key}")
 
@@ -310,15 +357,21 @@ def build_notification(events, key, is_full_season=False, total_eps=0):
         message = "Episode " + " + ".join(f"{num:02d}" for num in ep_list)
 
     poster_url = None
+
     local_season_poster = find_season_poster(series, season_num)
+
     if local_season_poster:
-        print(f"Local season poster found but unavailable to ntfy Attach: {local_season_poster}")
+        log.info(
+            "Local season poster found but unavailable to ntfy Attach: %s",
+            local_season_poster,
+        )
 
     for img_type in ["poster", "banner", "fanart"]:
         img = next(
             (i for i in series.get("images", []) if i.get("coverType") == img_type),
             None,
         )
+
         if img:
             poster_url = img.get("remoteUrl") or img.get("url")
             break
@@ -329,14 +382,24 @@ def build_notification(events, key, is_full_season=False, total_eps=0):
     return title, message, click_url, poster_url
 
 
-def flush_season(key, events_override=None, is_full_season=False, total_eps=0, flush_reason="buffer"):
+def flush_season(
+    key,
+    events_override=None,
+    is_full_season=False,
+    total_eps=0,
+    flush_reason="buffer",
+):
     try:
         with buffer_lock:
-            events = list(events_override) if events_override is not None else load_events_for_key(key)
+            events = (
+                list(events_override)
+                if events_override is not None
+                else load_events_for_key(key)
+            )
 
             if not events:
                 clear_state_for_key(key)
-                print(f"Empty buffer for {key}")
+                log.info("Empty buffer for %s", key)
                 return
 
             clear_state_for_key(key)
@@ -346,27 +409,20 @@ def flush_season(key, events_override=None, is_full_season=False, total_eps=0, f
         season_num = int(key.split(":")[1])
         ep_list = extract_episode_numbers(events)
 
-        # Dedup for "last episode" notifications
-        if flush_reason == "last_episode" and series_id:
-            now_ts = datetime.now(TIMEZONE).timestamp()
-            episodes_to_notify = []
+        if not ep_list:
+            log.warning("No episode numbers found for %s; skipping notification", key)
+            return
 
-            for ep_num in ep_list:
-                ep_key = f"{series_id}:{season_num}:{ep_num}"
-                prev = notified_last_episode.get(ep_key)
-                if prev is None or (now_ts - prev) >= LAST_EP_DEDUP_TTL:
-                    episodes_to_notify.append(ep_num)
+        fresh_episodes = should_notify_episodes(series_id, season_num, ep_list)
 
-            if not episodes_to_notify:
-                print(f"Skipping duplicate 'last episode' notification for {key} (within TTL)")
-                return
+        if not fresh_episodes:
+            log.info(
+                "Skipping duplicate notification for %s; episodes already notified: %s",
+                key,
+                ep_list,
+            )
+            return
 
-            # Rebuild message to only include episodes we’re actually notifying for
-            # (optional; if you prefer, you can still notify for all ep_list)
-            # For simplicity, we’ll just skip the whole notification if all are dupes.
-            # If at least one is new, we proceed normally but could adjust message if desired.
-
-        # Existing notification logic
         title, message, click_url, poster_url = build_notification(
             events,
             key,
@@ -376,73 +432,92 @@ def flush_season(key, events_override=None, is_full_season=False, total_eps=0, f
 
         ok = send_ntfy_curl_style(title, message, click_url, poster_url, "tv")
 
-        if ok and flush_reason == "last_episode" and series_id:
-            now_ts = datetime.now(TIMEZONE).timestamp()
-            for ep_num in ep_list:
-                ep_key = f"{series_id}:{season_num}:{ep_num}"
-                notified_last_episode[ep_key] = now_ts
+        if ok:
+            mark_episodes_notified(series_id, season_num, ep_list)
+            log.info(
+                "Notified %s: reason=%s episodes=%s",
+                key,
+                flush_reason,
+                ep_list,
+            )
+        else:
+            log.warning("Failed to send notification for %s", key)
 
     except Exception as e:
-        print(f"flush_season({key}) error: {e}")
-        import traceback
-        traceback.print_exc()
+        log.error("flush_season(%s) error: %s", key, e)
+        log.error(traceback.format_exc())
+
 
 def schedule_flush(key, delay_seconds):
     old_timer = timers.pop(key, None)
+
     if old_timer:
         try:
             old_timer.cancel()
         except Exception:
             pass
 
-    timer = threading.Timer(delay_seconds, flush_season, [key], kwargs={"flush_reason": "buffer"})
+    timer = threading.Timer(
+        delay_seconds,
+        flush_season,
+        [key],
+        kwargs={"flush_reason": "buffer"},
+    )
     timer.daemon = True
     timers[key] = timer
     timer.start()
 
 
-def cleanup_expired_dedup():
-    now = datetime.now(TIMEZONE).timestamp()
-    with buffer_lock:
-        expired = [k for k, ts in notified_complete.items() if (now - ts) >= COMPLETE_DEDUP_TTL]
-        for k in expired:
-            notified_complete.pop(k, None)
-    if expired:
-        print(f"Cleaned up {len(expired)} expired complete-notification entries")
-
-
 def cleanup_expired_episode_dedup():
     now = datetime.now(TIMEZONE).timestamp()
+
     with buffer_lock:
         expired = [
-            k for k, ts in notified_last_episode.items()
-            if (now - ts) >= LAST_EP_DEDUP_TTL
+            k
+            for k, ts in notified_episodes.items()
+            if (now - ts) >= EPISODE_DEDUP_TTL
         ]
+
         for k in expired:
-            notified_last_episode.pop(k, None)
+            notified_episodes.pop(k, None)
+
     if expired:
-        print(f"Cleaned up {len(expired)} expired last-episode dedup entries")
+        log.info("Cleaned up %d expired episode dedup entries", len(expired))
 
 
 @app.route("/sonarr-webhook", methods=["POST"])
 def webhook():
     try:
         payload = request.get_json(silent=True)
+
         if not payload:
             return jsonify({"error": "No JSON"}), 400
 
+        event_type = payload.get("eventType", "")
+
+        if event_type not in ALLOWED_EVENT_TYPES:
+            log.info("Ignoring Sonarr event type: %s", event_type)
+            return jsonify(
+                {
+                    "status": "ignored",
+                    "event_type": event_type,
+                    "reason": "event type not enabled",
+                }
+            ), 200
+
         series = payload.get("series", {})
         series_id = series.get("id")
+
         if not series_id:
             return jsonify({"error": "No series ID"}), 400
 
         episodes = payload.get("episodes", [])
         season = episodes[0].get("seasonNumber", 0) if episodes else 0
+
         if not isinstance(season, int) or season < 0:
             return jsonify({"error": "Invalid season number"}), 400
 
         key = f"{series_id}:{season}"
-        event_type = payload.get("eventType", "")
 
         flush_now = False
         flush_events = None
@@ -457,23 +532,43 @@ def webhook():
             existing_events.append(payload)
 
             ep_list = extract_episode_numbers(existing_events)
+
+            if not ep_list:
+                log.warning("Webhook contained no usable episode numbers for %s", key)
+                return jsonify(
+                    {
+                        "status": "ignored",
+                        "key": key,
+                        "reason": "no episode numbers",
+                    }
+                ), 200
+
             series_data = get_series(series_id)
             total_eps = get_season_total_eps(series_id, season, series_data)
 
-            expected_full_list = list(range(1, total_eps + 1)) if total_eps > 0 else []
+            expected_full_list = (
+                list(range(1, total_eps + 1)) if total_eps > 0 else []
+            )
             full_season = total_eps > 0 and ep_list == expected_full_list
 
             # If this payload/buffer includes Sonarr's latest released episode,
-            # send immediately. This applies even during the 01:00-08:30 window.
+            # send immediately, even during the quiet window.
             last_released = is_last_released_episode(series_id, existing_events)
 
-            print(
-                f"Buffered {key}: episodes={len(ep_list)} total_eps={total_eps} "
-                f"full_season={full_season} last_released={last_released}"
+            log.info(
+                "Buffered %s: episodes=%s total_eps=%s full_season=%s "
+                "last_released=%s event_type=%s",
+                key,
+                ep_list,
+                total_eps,
+                full_season,
+                last_released,
+                event_type,
             )
 
             if full_season or last_released:
                 old_timer = timers.pop(key, None)
+
                 if old_timer:
                     try:
                         old_timer.cancel()
@@ -492,15 +587,19 @@ def webhook():
                 if in_quiet_window():
                     delay_seconds = seconds_until_0830()
                     scheduled_for_0830 = True
-                    print(f"Quiet window: scheduling {key} for 08:30 Amsterdam time")
+                    log.info(
+                        "Quiet window: scheduling %s for 08:30 Amsterdam time",
+                        key,
+                    )
                 else:
                     delay_seconds = BUFFER_TIMEOUT
-                    print(f"Scheduling {key} in {BUFFER_TIMEOUT} seconds")
+                    log.info("Scheduling %s in %s seconds", key, BUFFER_TIMEOUT)
 
                 schedule_flush(key, delay_seconds)
 
         if flush_now:
             reason = "full_season" if full_season else "last_episode"
+
             flush_season(
                 key,
                 events_override=flush_events,
@@ -524,9 +623,8 @@ def webhook():
         ), 200
 
     except Exception as e:
-        print(f"Webhook ERROR: {e}")
-        import traceback
-        traceback.print_exc()
+        log.error("Webhook ERROR: %s", e)
+        log.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 
@@ -544,16 +642,20 @@ def health():
             "sonarr_api_loaded": bool(SONARR_API),
             "ntfy_token_loaded": bool(NTFY_TOKEN),
             "timezone": str(TIMEZONE),
+            "episode_dedup_ttl": EPISODE_DEDUP_TTL,
+            "allowed_event_types": sorted(ALLOWED_EVENT_TYPES),
         }
     )
 
 
 if __name__ == "__main__":
-    print(f"SONARR_URL={SONARR_URL}")
-    print(f"SONARR_API loaded={bool(SONARR_API)}")
-    print(f"NTFY_URL={NTFY_URL}")
-    print(f"NTFY_TOKEN loaded={bool(NTFY_TOKEN)}")
-    print(f"TIMEZONE={TIMEZONE}")
+    log.info("SONARR_URL=%s", SONARR_URL)
+    log.info("SONARR_API loaded=%s", bool(SONARR_API))
+    log.info("NTFY_URL=%s", NTFY_URL)
+    log.info("NTFY_TOKEN loaded=%s", bool(NTFY_TOKEN))
+    log.info("TIMEZONE=%s", TIMEZONE)
+    log.info("Allowed Sonarr event types=%s", sorted(ALLOWED_EVENT_TYPES))
+    log.info("Episode dedup TTL=%s seconds", EPISODE_DEDUP_TTL)
 
     success = send_ntfy_curl_style(
         title="Sonarr Season Webhook started",
@@ -561,18 +663,19 @@ if __name__ == "__main__":
         click_url=f"http://{HOST}:{PORT}",
         tags="tv,system",
     )
-    print("Startup notification sent" if success else "Failed to send startup notification")
 
+    log.info(
+        "Startup notification sent" if success else "Failed to send startup notification"
+    )
 
     def periodic_cleanup():
         while True:
             time.sleep(3600)
+
             try:
-                cleanup_expired_dedup()
                 cleanup_expired_episode_dedup()
             except Exception:
-                import traceback
-                traceback.print_exc()
+                log.error(traceback.format_exc())
 
     cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
     cleanup_thread.start()
